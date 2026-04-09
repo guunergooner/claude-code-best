@@ -25,6 +25,7 @@ import { logForDebugging } from '../../../utils/debug.js'
 import { addToTotalSessionCost } from '../../../cost-tracker.js'
 import { calculateUSDCost } from '../../../utils/modelCost.js'
 import { isEnvTruthy, isEnvDefinedFalsy } from '../../../utils/envUtils.js'
+import { getModelMaxOutputTokens } from '../../../utils/context.js'
 import type { Options } from '../claude.js'
 import { randomUUID } from 'crypto'
 import {
@@ -212,7 +213,20 @@ export async function* queryModelOpenAI(
       )
     }
 
-    // 10. Get client and make streaming request
+    // 10. Compute max_tokens — required by most OpenAI-compatible endpoints.
+    //     Without this the server uses a tiny default, and when
+    //     thinking is enabled the thinking phase consumes the entire budget
+    //     leaving no tokens for the final response.
+    //
+    //     Use upperLimit (not the slot-cap default) because the Anthropic path's
+    //     slot-reservation cap (CAPPED_DEFAULT_MAX_TOKENS=8k) is paired with an
+    //     auto-retry at 64k in query.ts. The OpenAI path has no such retry, so
+    //     using the capped 8k default would silently truncate responses in
+    //     multi-turn conversations where thinking consumes most of the budget.
+    const { upperLimit } = getModelMaxOutputTokens(openaiModel)
+    const maxTokens = options.maxOutputTokensOverride ?? upperLimit
+
+    // 11. Get client and make streaming request
     const client = getOpenAIClient({
       maxRetries: 0,
       fetchOverride: options.fetchOverride,
@@ -244,6 +258,7 @@ export async function* queryModelOpenAI(
     // Accumulate content blocks and usage, same as the Anthropic path in claude.ts
     const contentBlocks: Record<number, any> = {}
     let partialMessage: any
+    let stopReason: string | null = null
     let usage = {
       input_tokens: 0,
       output_tokens: 0,
@@ -297,21 +312,7 @@ export async function* queryModelOpenAI(
           break
         }
         case 'content_block_stop': {
-          const idx = (event as any).index
-          const block = contentBlocks[idx]
-          if (!block || !partialMessage) break
-
-          const m: AssistantMessage = {
-            message: {
-              ...partialMessage,
-              content: normalizeContentFromAPI([block], tools, options.agentId),
-            },
-            requestId: undefined,
-            type: 'assistant',
-            uuid: randomUUID(),
-            timestamp: new Date().toISOString(),
-          }
-          yield m
+          // Block accumulation is complete; assembly happens at message_stop.
           break
         }
         case 'message_delta': {
@@ -319,12 +320,66 @@ export async function* queryModelOpenAI(
           if (deltaUsage) {
             usage = { ...usage, ...deltaUsage }
           }
-          // Update the stop_reason on the last yielded message
-          // (we don't have a reference here, but the consumer handles this)
+          if ((event as any).delta?.stop_reason != null) {
+            stopReason = (event as any).delta.stop_reason
+          }
           break
         }
-        case 'message_stop':
+        case 'message_stop': {
+          // Assemble ONE AssistantMessage with ALL content blocks, matching the
+          // Anthropic SDK path. Real usage (input + output tokens) is available
+          // here and injected so tokenCountWithEstimation() can read it.
+          if (partialMessage) {
+            const allBlocks = Object.keys(contentBlocks)
+              .sort((a, b) => Number(a) - Number(b))
+              .map(k => contentBlocks[Number(k)])
+              .filter(Boolean)
+            if (allBlocks.length > 0) {
+              yield {
+                message: {
+                  ...partialMessage,
+                  content: normalizeContentFromAPI(allBlocks, tools, options.agentId),
+                  usage,
+                  // Apply the stop_reason captured from message_delta.
+                  // partialMessage comes from message_start which always has
+                  // stop_reason: null; without this override it stays null.
+                  stop_reason: stopReason,
+                  stop_sequence: null,
+                },
+                requestId: undefined,
+                type: 'assistant',
+                uuid: randomUUID(),
+                timestamp: new Date().toISOString(),
+              } as AssistantMessage
+            }
+            // Reset partialMessage so the post-loop safety fallback does not
+            // yield a second identical AssistantMessage. Without this reset,
+            // both messages share the same message.id and normalizeMessagesForAPI
+            // merges them via mergeAssistantMessages — concatenating content arrays
+            // and duplicating thinking blocks, which produces doubled
+            // reasoning_content in the next request.
+            partialMessage = null
+          }
+          // Track cost and token usage
+          if (usage.input_tokens + usage.output_tokens > 0) {
+            const costUSD = calculateUSDCost(openaiModel, usage as any)
+            addToTotalSessionCost(costUSD, usage as any, options.model)
+          }
+          // Mirror the Anthropic path's max_tokens retry signal: yield an
+          // apiError='max_output_tokens' message so query.ts can detect the
+          // truncation and retry (escalate to 64k, then inject recovery message
+          // up to MAX_OUTPUT_TOKENS_RECOVERY_LIMIT times). Without this, a
+          // truncated OpenAI response would silently end the conversation.
+          if (stopReason === 'max_tokens') {
+            yield createAssistantAPIErrorMessage({
+              content: `Output truncated: response exceeded the ${maxTokens} token limit. ` +
+                `Set CLAUDE_CODE_MAX_OUTPUT_TOKENS to override.`,
+              apiError: 'max_output_tokens',
+              error: 'max_output_tokens',
+            })
+          }
           break
+        }
       }
 
       // Track cost and token usage (matching the Anthropic path in claude.ts)
@@ -342,6 +397,37 @@ export async function* queryModelOpenAI(
         event,
         ...(event.type === 'message_start' ? { ttftMs } : undefined),
       } as StreamEvent
+    }
+
+    // Safety: if stream ended without message_stop, assemble and yield whatever we have
+    if (partialMessage) {
+      const allBlocks = Object.keys(contentBlocks)
+        .sort((a, b) => Number(a) - Number(b))
+        .map(k => contentBlocks[Number(k)])
+        .filter(Boolean)
+      if (allBlocks.length > 0) {
+        yield {
+          message: {
+            ...partialMessage,
+            content: normalizeContentFromAPI(allBlocks, tools, options.agentId),
+            usage,
+            stop_reason: stopReason,
+            stop_sequence: null,
+          },
+          requestId: undefined,
+          type: 'assistant',
+          uuid: randomUUID(),
+          timestamp: new Date().toISOString(),
+        } as AssistantMessage
+      }
+      if (stopReason === 'max_tokens') {
+        yield createAssistantAPIErrorMessage({
+          content: `Output truncated: response exceeded the ${maxTokens} token limit. ` +
+            `Set CLAUDE_CODE_MAX_OUTPUT_TOKENS to override.`,
+          apiError: 'max_output_tokens',
+          error: 'max_output_tokens',
+        })
+      }
     }
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error)
